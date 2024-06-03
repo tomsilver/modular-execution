@@ -1,7 +1,5 @@
 """Tests for planning and execution with a hierarchy."""
 
-from typing import Set
-
 import gymnasium as gym
 import numpy as np
 from modular_perception.modules.object_detection_module import ObjectDetectionModule
@@ -11,18 +9,19 @@ from modular_perception.modules.predicate_modules import (
     LocalPredicateModule,
     PredicateDispatchModule,
 )
-from modular_perception.modules.sensor_module import SensorModule
 from modular_perception.perceiver import (
     ModularPerceiver,
-    ModuleCannotAnswerQuery,
-    PerceptionModule,
 )
 from modular_perception.query_types import (
-    PredicatesQuery,
     SensorQuery,
+    AllGroundAtomsQuery,
+    ExternalGoalQuery,
 )
 from modular_perception.utils import wrap_gym_env_with_sensor_module
-from relational_structs import GroundAtom, Predicate, Type
+from relational_structs import Predicate, Type
+from modular_execution.executor import ModularExecutor
+from modular_execution.utils import create_execution_module_from_gym_env
+
 
 ################################################################################
 #                                Environment                                   #
@@ -30,7 +29,7 @@ from relational_structs import GroundAtom, Predicate, Type
 
 
 class _GridEnv(gym.Env):
-    """A simple 2D grid environment for testing."""
+    """Collect all the letters."""
 
     _grid = np.array(
         [
@@ -49,12 +48,15 @@ class _GridEnv(gym.Env):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self._robot_loc = (0, 0)
+        self.robot_loc = (0, 0)
+        self.remaining_letters = set(np.unique(self._grid)) - {"X"}
+        self.terminated = False
 
     def reset(self, *args, **kwargs):
         super().reset(*args, **kwargs)
-        self._robot_loc = (0, 0)
-        return self._robot_loc, {}
+        self.robot_loc = (0, 0)
+        self.terminated = False
+        return self.robot_loc, {}
 
     def step(self, action):
         assert action in ("up", "down", "left", "right")
@@ -64,11 +66,13 @@ class _GridEnv(gym.Env):
             "left": (0, -1),
             "right": (0, 1),
         }[action]
-        r, c = self._robot_loc
+        r, c = self.robot_loc
         nr, nc = r + dr, c + dc
         if 0 <= r < self._grid.shape[0] and 0 <= c < self._grid.shape[1]:
-            self._robot_loc = (nr, nc)
-        return self._robot_loc, 0.0, False, False, {}
+            self.robot_loc = (nr, nc)
+            self.remaining_letters.discard(self._grid[nr, nc])
+        self.terminated = not self.remaining_letters
+        return self.robot_loc, 0.0, self.terminated, False, {}
 
     def render(self, *args, **kwargs):
         raise NotImplementedError
@@ -219,10 +223,40 @@ def _create_perceiver(sensor_module):
             local_predicate_module,
             image_predicate_module,
             predicate_dispatch_module,
+            external_goal_module,
         }
     )
 
     return perceiver
+
+
+def _create_executor(primitive_action_module, perceiver, seed):
+    import ipdb; ipdb.set_trace()
+
+    # Create the modules.
+    atom_query = AllGroundAtomsQuery()
+    goal_query = ExternalGoalQuery()
+    task_planning_module = TaskPlanningModule(
+        atom_query,
+        goal_query,
+        perceiver,
+        seed,
+    )
+
+    operator_module = OperatorExecutionModule(
+        operator_to_executor, perceiver, seed,
+    )
+
+    # Finalize the executor.
+    executor = ModularExecutor(
+        {
+            task_planning_module,
+            operator_module,
+            primitive_action_module,
+        }
+    )
+
+    return executor
 
 
 ################################################################################
@@ -236,6 +270,18 @@ def test_hierarchical_actions():
     # Create the environment.
     env = _GridEnv()
     env, sensor_module = wrap_gym_env_with_sensor_module(env)
+    seed = 123
 
     # Create the perceiver.
     perceiver = _create_perceiver(sensor_module)
+
+    # Create the executor.
+    primitive_action_module = create_execution_module_from_gym_env(env, perceiver, seed)
+    agent = _create_executor(primitive_action_module, perceiver, seed)
+
+    # Run.
+    for _ in range(100):
+        if env.unwrapped.terminated:
+            break
+        agent.execute()
+    assert env.unwrapped.terminated

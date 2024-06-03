@@ -6,8 +6,8 @@ from modular_perception.utils import wrap_gym_env_with_sensor_module
 
 from modular_execution.action_types import PrimitiveAction, RandomAction
 from modular_execution.executor import ModularExecutor
-from modular_execution.modules.primitive_action_module import PrimitiveActionModule
 from modular_execution.modules.random_action_module import RandomActionModule
+from modular_execution.utils import create_execution_module_from_gym_env
 
 
 def test_gym_api():
@@ -29,10 +29,7 @@ def test_gym_api():
     perceiver = ModularPerceiver({sensor_module})
 
     # Create an executor that executes random actions.
-    def _execution_fn(action):
-        env.step(action)
-
-    primitive_action_module = PrimitiveActionModule(_execution_fn, perceiver, seed)
+    primitive_action_module = create_execution_module_from_gym_env(env, perceiver, seed)
 
     def _sample_fn():
         return PrimitiveAction(env.action_space.sample())
