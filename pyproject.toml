@@ -5,12 +5,16 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "modular_execution"
 version = "0.1.0"
-description = "A basic starter for Python packages."
+description = "Modular execution."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
    "matplotlib",
    "numpy",
+   "modular_perception@git+https://github.com/tomsilver/modular-perception.git",
+   "tomsutils@git+https://github.com/tomsilver/toms-utils.git",
+   "gymnasium[classic-control]",
+   "relational_structs@git+https://github.com/tomsilver/relational-structs.git",
 ]
 
 [project.optional-dependencies]
