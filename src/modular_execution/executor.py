@@ -38,11 +38,6 @@ class ModularExecutor:
         for module in self._modules:
             module.reset(seed)
 
-    def tick(self) -> None:
-        """Advance time for all modules."""
-        for module in self._modules:
-            module.tick()
-
     def execute(
         self,
         action: Any | None = None,
@@ -88,7 +83,6 @@ class ExecutionModule(abc.ABC, Generic[Action]):
     def __init__(self, perceiver: ModularPerceiver, seed: int = 0) -> None:
         self._perceiver = perceiver
         self._set_seed(seed)
-        self._time = 0
         self._executor: ModularExecutor | None = None
 
     def set_executor(self, executor: ModularExecutor):
@@ -108,7 +102,7 @@ class ExecutionModule(abc.ABC, Generic[Action]):
 
     #################### Sending actions TO other modules #####################
 
-    def _send_action(self, action: Any) -> Any:
+    def _delegate_execution(self, action: Any) -> Any:
         """Convenient method for delegating execution to another module.
 
         Note that the action type is not Action because it should be the
@@ -121,10 +115,5 @@ class ExecutionModule(abc.ABC, Generic[Action]):
 
     def reset(self, seed: int | None = None) -> None:
         """Reset the module."""
-        self._time = 0
         if seed is not None:
             self._set_seed(seed)
-
-    def tick(self) -> None:
-        """Advance time."""
-        self._time += 1
