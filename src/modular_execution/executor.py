@@ -9,6 +9,7 @@ from typing import (
     Generic,
     Set,
     Tuple,
+    TypeAlias,
     TypeVar,
 )
 
@@ -17,7 +18,7 @@ from modular_perception.perceiver import ModularPerceiver
 from tomsutils.utils import draw_dag
 
 Action = TypeVar("Action")
-Status = TypeVar("Status")
+Status: TypeAlias = Any
 
 
 class ModularExecutor:
@@ -44,10 +45,13 @@ class ModularExecutor:
 
     def execute(
         self,
-        action: Any,
+        action: Any | None = None,
         sender: ExecutionModule | None = None,
     ) -> Any:
         """Find a module that can execute the action, and execute it.
+
+        Conventionally, an action of None is reserved for the top level.
+        So at each step, the agent should do executor.execute().
 
         The sender is provided just for logging purposes. A sender of
         None means that the request came from outside the perceiver.
@@ -78,7 +82,7 @@ class ModuleCannotExecuteAction(Exception):
     """Raised when a module is given an action it cannot execute."""
 
 
-class ExecutionModule(abc.ABC, Generic[Action, Status]):
+class ExecutionModule(abc.ABC, Generic[Action]):
     """Base class for a module."""
 
     def __init__(self, perceiver: ModularPerceiver, seed: int = 0) -> None:
