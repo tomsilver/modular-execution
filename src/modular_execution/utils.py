@@ -13,5 +13,6 @@ def create_execution_module_from_gym_env(
 
     def _execution_fn(action):
         env.step(action)
+        perceiver.tick()
 
     return PrimitiveActionModule(_execution_fn, perceiver, seed)

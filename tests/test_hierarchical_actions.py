@@ -14,14 +14,16 @@ from modular_perception.perceiver import (
 )
 from modular_perception.query_types import (
     SensorQuery,
-    AllGroundAtomsQuery,
-    ExternalGoalQuery,
 )
 from modular_perception.utils import wrap_gym_env_with_sensor_module
-from relational_structs import Predicate, Type
-from modular_execution.executor import ModularExecutor
-from modular_execution.utils import create_execution_module_from_gym_env
+from relational_structs import LiftedOperator, Predicate, Type
 
+from modular_execution.action_types import GoalStrAction, PrimitiveAction
+from modular_execution.executor import ModularExecutor
+from modular_execution.modules.goal_translation_module import GoalTranslationModule
+from modular_execution.modules.operator_execution_module import OperatorExecutionModule
+from modular_execution.modules.task_planning_module import TaskPlanningModule
+from modular_execution.utils import create_execution_module_from_gym_env
 
 ################################################################################
 #                                Environment                                   #
@@ -33,7 +35,7 @@ class _GridEnv(gym.Env):
 
     _grid = np.array(
         [
-            ["X", "X", "X", "X", "X", "X", "X", "X", "G"],
+            ["R", "X", "X", "X", "X", "X", "X", "X", "G"],
             ["X", "A", "X", "X", "X", "X", "X", "X", "X"],
             ["X", "B", "X", "X", "C", "X", "X", "X", "X"],
             ["X", "X", "X", "X", "D", "X", "X", "X", "X"],
@@ -48,15 +50,17 @@ class _GridEnv(gym.Env):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.robot_loc = (0, 0)
-        self.remaining_letters = set(np.unique(self._grid)) - {"X"}
+        self._obs = self._grid.copy()
         self.terminated = False
+
+    def _get_observation(self):
+        return self._obs.copy()
 
     def reset(self, *args, **kwargs):
         super().reset(*args, **kwargs)
-        self.robot_loc = (0, 0)
+        self._obs = self._grid.copy()
         self.terminated = False
-        return self.robot_loc, {}
+        return self._get_observation(), {}
 
     def step(self, action):
         assert action in ("up", "down", "left", "right")
@@ -66,13 +70,14 @@ class _GridEnv(gym.Env):
             "left": (0, -1),
             "right": (0, 1),
         }[action]
-        r, c = self.robot_loc
+        r, c = np.argwhere(self._obs == "R")[0]
         nr, nc = r + dr, c + dc
-        if 0 <= r < self._grid.shape[0] and 0 <= c < self._grid.shape[1]:
-            self.robot_loc = (nr, nc)
-            self.remaining_letters.discard(self._grid[nr, nc])
-        self.terminated = not self.remaining_letters
-        return self.robot_loc, 0.0, self.terminated, False, {}
+        if not (0 <= r < self._grid.shape[0] and 0 <= c < self._grid.shape[1]):
+            nr, nc = r, c
+        self._obs[r, c] = "X"
+        self._obs[nr, nc] = "R"
+        self.terminated = len(np.unique(self._obs)) == 2
+        return self._get_observation(), 0.0, self.terminated, False, {}
 
     def render(self, *args, **kwargs):
         raise NotImplementedError
@@ -83,21 +88,60 @@ class _GridEnv(gym.Env):
 ################################################################################
 
 
-def _create_environment_specific_perceiver_models():
-    # Types.
-    Letter = Type("Letter")
-    object_types = {Type("Letter")}
+def _create_types():
+    return {Type("Letter"), Type("Robot")}
 
-    # Objects.
-    def _detect_objects(img, types):
-        assert set(types) == object_types
-        letters = set(np.unique(img)) - {"X"}
-        return frozenset(Letter(l) for l in letters)
 
-    # Object features.
+def _create_predicates(types):
+    Letter = {t.name: t for t in types}["Letter"]
+    return {
+        Predicate("Collected", [Letter]),
+        Predicate("NotCollected", [Letter]),
+        Predicate("IsDirectlyAbove", [Letter, Letter]),
+        Predicate("IsAnywhereAbove", [Letter, Letter]),
+        Predicate("InOneThickEmptySpace", [Letter]),
+        Predicate("InTwoThickEmptySpace", [Letter]),
+    }
+
+
+def _create_symbolic_goal_detector(predicates, types):
+    type_name_to_type = {t.name: t for t in types}
+    Letter = type_name_to_type["Letter"]
+    pred_name_to_pred = {p.name: p for p in predicates}
+    Collected = pred_name_to_pred["Collected"]
+
+    def _detect_symbolic_goal(get_objects, goal_str):
+        assert goal_str == "collect all the letters"
+        objects = get_objects()
+        letters = {o for o in objects if o.is_instance(Letter)}
+        return {Collected([letter]) for letter in letters}
+
+    return _detect_symbolic_goal
+
+
+def _create_object_detector(types):
+    type_name_to_type = {t.name: t for t in types}
+    Robot = type_name_to_type["Robot"]
+    Letter = type_name_to_type["Letter"]
+
+    def _detect_objects(img):
+        letters = set(np.unique(img)) - {"R", "X"}
+        letter_objs = frozenset(Letter(l) for l in letters)
+        return letter_objs | {Robot("R")}
+
+    return _detect_objects
+
+
+def _create_feature_detector(types):
+    type_name_to_type = {t.name: t for t in types}
+    Letter = type_name_to_type["Letter"]
+
     def _detect_object_features(img, obj, feature):
         assert feature in ("r", "c")
         idxs = np.argwhere(img == obj.name)
+        if len(idxs) == 0:
+            assert obj.is_instance(Letter)
+            return -1  # does not exist
         assert len(idxs) == 1
         r, c = idxs[0]
         if feature == "r":
@@ -105,33 +149,61 @@ def _create_environment_specific_perceiver_models():
         assert feature == "c"
         return c
 
-    # Local predicates.
-    IsDirectlyAbove = Predicate("IsDirectlyAbove", [Letter, Letter])
+    return _detect_object_features
+
+
+def _create_local_predicate_interpretations(predicates):
+    pred_name_to_pred = {p.name: p for p in predicates}
+    pred_to_interpretation = {}
+
+    Collected = pred_name_to_pred["Collected"]
+
+    def _Collected_holds(get_feature, obj):
+        return get_feature(obj, "r") == -1
+
+    pred_to_interpretation[Collected] = _Collected_holds
+
+    NotCollected = pred_name_to_pred["NotCollected"]
+
+    def _NotCollected_holds(get_feature, obj):
+        return not _Collected_holds(get_feature, obj)
+
+    pred_to_interpretation[NotCollected] = _NotCollected_holds
+
+    IsDirectlyAbove = pred_name_to_pred["IsDirectlyAbove"]
 
     def _IsDirectlyAbove_holds(get_feature, obj1, obj2):
+        if _Collected_holds(get_feature, obj1) or _Collected_holds(get_feature, obj2):
+            return False
         r1 = get_feature(obj1, "r")
         c1 = get_feature(obj1, "c")
         r2 = get_feature(obj2, "r")
         c2 = get_feature(obj2, "c")
         return (r1 == r2 - 1) and (c1 == c2)
 
-    IsAnywhereAbove = Predicate("IsAnywhereAbove", [Letter, Letter])
+    pred_to_interpretation[IsDirectlyAbove] = _IsDirectlyAbove_holds
+
+    IsAnywhereAbove = pred_name_to_pred["IsAnywhereAbove"]
 
     def _IsAnywhereAbove_holds(get_feature, obj1, obj2):
+        if _Collected_holds(get_feature, obj1) or _Collected_holds(get_feature, obj2):
+            return False
         r1 = get_feature(obj1, "r")
         c1 = get_feature(obj1, "c")
         r2 = get_feature(obj2, "r")
         c2 = get_feature(obj2, "c")
         return (r1 < r2) and (c1 == c2)
 
-    predicate_interpretations = {
-        IsDirectlyAbove: _IsDirectlyAbove_holds,
-        IsAnywhereAbove: _IsAnywhereAbove_holds,
-    }
+    pred_to_interpretation[IsAnywhereAbove] = _IsAnywhereAbove_holds
 
-    # Image predicates.
-    InOneThickEmptySpace = Predicate("InOneThickEmptySpace", [Letter])
-    InTwoThickEmptySpace = Predicate("InTwoThickEmptySpace", [Letter])
+    return pred_to_interpretation
+
+
+def _create_image_predicate_interpretations(predicates):
+    pred_name_to_pred = {p.name: p for p in predicates}
+
+    InOneThickEmptySpace = pred_name_to_pred["InOneThickEmptySpace"]
+    InTwoThickEmptySpace = pred_name_to_pred["InTwoThickEmptySpace"]
     image_predicates = {InOneThickEmptySpace, InTwoThickEmptySpace}
 
     def _detect_image_predicates(predicates, objects, get_feature, get_image):
@@ -165,14 +237,57 @@ def _create_environment_specific_perceiver_models():
 
         return true_ground_atoms
 
-    return (
-        object_types,
-        _detect_objects,
-        _detect_object_features,
-        predicate_interpretations,
-        image_predicates,
-        _detect_image_predicates,
+    return _detect_image_predicates, image_predicates
+
+
+def _create_operators(predicates, types):
+    pred_name_to_pred = {p.name: p for p in predicates}
+    type_name_to_type = {t.name: t for t in types}
+    Collected = pred_name_to_pred["Collected"]
+    NotCollected = pred_name_to_pred["NotCollected"]
+    Letter = type_name_to_type["Letter"]
+    Robot = type_name_to_type["Robot"]
+
+    robot = Robot("?robot")
+    letter = Letter("?letter")
+    CollectLetter = LiftedOperator(
+        name="CollectLetter",
+        parameters=[letter, robot],
+        preconditions={NotCollected([letter])},
+        add_effects={Collected([letter])},
+        delete_effects={NotCollected([letter])},
     )
+
+    return {CollectLetter}
+
+
+def _create_operator_interpretations(operators):
+    operator_name_to_operator = {o.name: o for o in operators}
+    CollectLetter = operator_name_to_operator["CollectLetter"]
+
+    def _execute_CollectLetter(get_feature, letter, robot):
+        rob_r = get_feature(robot, "r")
+        rob_c = get_feature(robot, "c")
+        let_r = get_feature(letter, "r")
+        let_c = get_feature(letter, "c")
+        plan = []
+        if let_r == -1:
+            return plan
+        if rob_r < let_r:
+            for _ in range(let_r - rob_r):
+                plan.append(PrimitiveAction("down"))
+        if rob_r > let_r:
+            for _ in range(rob_r - let_r):
+                plan.append(PrimitiveAction("up"))
+        if rob_c < let_c:
+            for _ in range(let_c - rob_c):
+                plan.append(PrimitiveAction("right"))
+        if rob_c > let_c:
+            for _ in range(rob_c - let_c):
+                plan.append(PrimitiveAction("left"))
+        return plan
+
+    return {CollectLetter: _execute_CollectLetter}
 
 
 ################################################################################
@@ -181,37 +296,32 @@ def _create_environment_specific_perceiver_models():
 
 
 def _create_perceiver(sensor_module):
-    # Get environment-specific models.
-    (
-        object_types,
-        _detect_objects,
-        _detect_object_features,
-        predicate_interpretations,
-        image_predicates,
-        _detect_image_predicates,
-    ) = _create_environment_specific_perceiver_models()
-
-    # Query to get image.
-    image_query = SensorQuery("gym_observation")
+    # Create environment-specific models.
+    types = _create_types()
+    predicates = _create_predicates(types)
+    local_interp = _create_local_predicate_interpretations(predicates)
+    image_interp, image_preds = _create_image_predicate_interpretations(predicates)
+    detect_object_features = _create_feature_detector(types)
+    detect_objects = _create_object_detector(types)
 
     # Build the modules.
+    image_query = SensorQuery("gym_observation")
     object_detection_module = ObjectDetectionModule(
-        _detect_objects, sensory_input_query=image_query
+        detect_objects, sensory_input_query=image_query
     )
     object_feature_module = ObjectFeatureModule(
-        _detect_object_features, sensory_input_query=image_query
+        detect_object_features, sensory_input_query=image_query
     )
     local_predicate_module = LocalPredicateModule(
-        predicate_interpretations,
+        local_interp,
     )
     image_predicate_module = ImagePredicateModule(
-        _detect_image_predicates,
+        image_interp,
         image_query=image_query,
     )
     predicate_dispatch_module = PredicateDispatchModule(
-        local_predicates=frozenset(predicate_interpretations),
-        image_predicates=frozenset(image_predicates),
-        object_types=frozenset(object_types),
+        local_predicates=frozenset(local_interp),
+        image_predicates=frozenset(image_preds),
     )
 
     # Finalize the perceiver.
@@ -223,7 +333,6 @@ def _create_perceiver(sensor_module):
             local_predicate_module,
             image_predicate_module,
             predicate_dispatch_module,
-            external_goal_module,
         }
     )
 
@@ -231,25 +340,38 @@ def _create_perceiver(sensor_module):
 
 
 def _create_executor(primitive_action_module, perceiver, seed):
-    import ipdb; ipdb.set_trace()
+    # Create environment-specific models.
+    types = _create_types()
+    predicates = _create_predicates(types)
+    detect_goal = _create_symbolic_goal_detector(predicates, types)
+    operators = _create_operators(predicates, types)
+    operator_interpretations = _create_operator_interpretations(operators)
 
     # Create the modules.
-    atom_query = AllGroundAtomsQuery()
-    goal_query = ExternalGoalQuery()
+    goal_translation_module = GoalTranslationModule(
+        detect_goal,
+        perceiver,
+        seed,
+    )
+
     task_planning_module = TaskPlanningModule(
-        atom_query,
-        goal_query,
+        operators,
+        predicates,
+        types,
         perceiver,
         seed,
     )
 
     operator_module = OperatorExecutionModule(
-        operator_to_executor, perceiver, seed,
+        operator_interpretations,
+        perceiver,
+        seed,
     )
 
     # Finalize the executor.
     executor = ModularExecutor(
         {
+            goal_translation_module,
             task_planning_module,
             operator_module,
             primitive_action_module,
@@ -279,9 +401,10 @@ def test_hierarchical_actions():
     primitive_action_module = create_execution_module_from_gym_env(env, perceiver, seed)
     agent = _create_executor(primitive_action_module, perceiver, seed)
 
+    # Create a goal, which is like a top-level action.
+    goal = GoalStrAction("collect all the letters")
+
     # Run.
-    for _ in range(100):
-        if env.unwrapped.terminated:
-            break
-        agent.execute()
+    env.reset()
+    agent.execute(goal)
     assert env.unwrapped.terminated
