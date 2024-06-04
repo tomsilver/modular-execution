@@ -68,6 +68,10 @@ jobs:
     - name: Install dependencies
       run: |
         pip install -e ".[develop]"
+        git clone https://github.com/aibasel/downward.git
+        cd downward && ./build.py
+        export FD_EXEC_PATH="$(pwd)/build"
+        cd ../
     - name: Pytest
       run: |
         pytest tests/
