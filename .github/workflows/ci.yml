@@ -54,8 +54,6 @@ jobs:
         mypy .
   unit-tests:
     runs-on: ubuntu-latest
-    env:
-      FD_EXEC_PATH: ${{ vars.GITHUB_WORKSPACE }}/downward
     strategy:
       matrix:
         python-version: ["3.10"]
@@ -70,8 +68,6 @@ jobs:
     - name: Install dependencies
       run: |
         pip install -e ".[develop]"
-        git clone https://github.com/aibasel/downward.git
-        cd downward && ./build.py && cd ../
     - name: Pytest
       run: |
         pytest tests/

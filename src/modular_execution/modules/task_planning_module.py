@@ -42,7 +42,9 @@ class TaskPlanningModule(ExecutionModule[SymbolicGoalAction]):
             self._domain_name, "task-planning-module-problem", objects, init, goal
         )
         # Run task planning.
-        plan_strs = run_pddl_planner(str(self._pddl_domain), str(pddl_problem))
+        plan_strs = run_pddl_planner(
+            str(self._pddl_domain), str(pddl_problem), planner="pyperplan"
+        )
         plan = parse_pddl_plan(plan_strs, self._pddl_domain, pddl_problem)
         for ground_operator in plan:
             self._delegate_execution(OperatorAction(ground_operator))
